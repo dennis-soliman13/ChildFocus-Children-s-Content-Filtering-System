@@ -133,48 +133,35 @@ def _download_video_only(video_id: str, out_path: str, max_duration: int = 90) -
 # ── Download: audio-only stream (tiny file, fast) ─────────────────────────────
 def _download_audio_only(video_id: str, out_path: str, max_duration: int = 90) -> bool:
     """
-    Downloads the lowest-quality audio-only stream (m4a/webm/opus).
-    Robust format chain covers videos where worstaudio is unavailable.
+    Downloads the lowest-quality audio-only stream (m4a/webm).
+    Typically 20-90KB for a 20s segment — downloads in <1s on decent connection.
     Used exclusively for ATT computation.
     """
     urls = [
         f"https://www.youtube.com/watch?v={video_id}",
         f"https://www.youtube.com/shorts/{video_id}",
     ]
-
-    # Use a stem path so yt-dlp can append whatever extension it needs
-    out_stem = out_path.replace(".m4a", "")
-
     for url in urls:
         try:
             opts = _base_opts()
             opts.update({
-                # Robust audio format chain:
-                # 1. worstaudio[ext=m4a]  → smallest m4a audio stream
-                # 2. worstaudio           → any smallest audio stream
-                # 3. bestaudio[ext=m4a]  → fallback to best m4a if worst unavailable
-                # 4. bestaudio           → any audio stream (last resort)
-                # 5. worst               → full muxed video as last fallback (still faster than best)
-                "format":            "worstaudio[ext=m4a]/worstaudio/bestaudio[ext=m4a]/bestaudio/worst",
-                "outtmpl":           out_stem + ".%(ext)s",   # let yt-dlp pick extension
+                "format":            "worstaudio/bestaudio",
+                "outtmpl":           out_path,
                 "download_sections": [f"*0-{max_duration}"],
                 "postprocessors":    [],
             })
             with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.extract_info(url, download=True)
-
-            # Find the file yt-dlp actually wrote (any audio extension)
-            for ext in ["m4a", "webm", "opus", "mp3", "ogg", "mp4"]:
-                candidate = f"{out_stem}.{ext}"
-                if os.path.exists(candidate) and os.path.getsize(candidate) > 500:
+            # yt-dlp may append extension — find the actual file
+            for ext in [".m4a", ".webm", ".opus", ".mp3", ".ogg", ""]:
+                candidate = out_path + ext if ext else out_path
+                if os.path.exists(candidate):
+                    # rename to expected path if needed
                     if candidate != out_path:
                         os.replace(candidate, out_path)
                     return True
-
-        except Exception as e:
-            print(f"[AUDIO-DL] {url} failed: {e}")
+        except Exception:
             continue
-
     return False
 
 
@@ -308,7 +295,7 @@ def compute_att(audio_source: str, start_sec: int, duration: int) -> float:
                 duration=float(duration),
                 sr=ATT_SR,              # 8000 Hz — 4x faster than 22050
                 mono=True,
-                res_type="kaiser_fast",
+                res_type="soxr_hq",
             )
             if len(y) > 50:
                 strength = librosa.onset.onset_strength(y=y, sr=sr)
@@ -471,9 +458,9 @@ def sample_video(video_id: str, thumbnail_url: str = "") -> dict:
         # Step 5: Aggregate
         max_seg   = max(s["score_h"] for s in segments)
         agg_score = round(0.80 * max_seg + 0.20 * thumb, 4)
-        label = ("Overstimulating" if agg_score >= 0.75
-             else "Educational" if agg_score <= 0.35
-            else "Neutral")
+        label     = ("Overstimulating" if agg_score >= 0.75
+                     else "Safe"       if agg_score <= 0.35
+                     else "Uncertain")
 
         total = time.time() - t_start
         print(f"[SAMPLER] ✓ Score: {agg_score} → {label}")
