@@ -120,6 +120,22 @@ def _action(label: str) -> str:
     }.get(label, "allowed")
 
 
+def _log_cache_hit(cached: dict, route: str, runtime: float):
+    """Print full classification summary for cache hits."""
+    vid   = cached.get("video_id", "?")
+    title = (cached.get("video_title") or "")[:45]
+    print(f"[CACHE] ══════════════════════════════════════")
+    print(f"[CACHE] Hit ({route}): {vid}")
+    print(f"[CACHE] Title     : {title!r}")
+    print(f"[CACHE] NB Score  : {cached.get('nb_score')}  →  {cached.get('nb_label', 'N/A')}")
+    print(f"[CACHE] Heuristic : {cached.get('heuristic_score')}")
+    print(f"[CACHE] Thumbnail : {cached.get('thumbnail_intensity')}")
+    print(f"[CACHE] Final     : {cached.get('final_score')}  →  {cached.get('label')}  ({cached.get('action')})")
+    print(f"[CACHE] Last seen : {cached.get('last_checked')}")
+    print(f"[CACHE] Runtime   : {runtime}s")
+    print(f"[CACHE] ══════════════════════════════════════")
+
+
 # ── POST /classify_fast ────────────────────────────────────────────────────────
 @classify_bp.route("/classify_fast", methods=["POST"])
 def classify_fast():
@@ -148,10 +164,11 @@ def classify_fast():
     # ── Phase 1: Cache lookup ──────────────────────────────────────────────────
     cached = _get_cached(video_id)
     if cached and cached.get("final_score") is not None:
-        print(f"[ROUTE] Cache hit: {video_id}")
+        runtime = round(time.time() - t_start, 3)
         cached["classified_by"] = "cache"
-        cached["runtime_seconds"] = round(time.time() - t_start, 3)
+        cached["runtime_seconds"] = runtime
         cached["action"] = _action(cached.get("label", "Neutral"))
+        _log_cache_hit(cached, route="classify_fast", runtime=runtime)
         return jsonify(cached)
 
     # ── Phase 2: Metadata + NB + Thumbnail ────────────────────────────────────
@@ -218,6 +235,16 @@ def classify_full():
 
     video_id      = extract_video_id(data["video_url"])
     thumbnail_url = data.get("thumbnail_url", "")
+
+    # ── Cache check: only skip if already has heuristic_score ─────────────────
+    cached = _get_cached(video_id)
+    if cached and cached.get("heuristic_score") is not None:
+        runtime = round(time.time() - t_start, 3)
+        cached["classified_by"] = "cache"
+        cached["runtime_seconds"] = runtime
+        cached["action"] = _action(cached.get("label", "Neutral"))
+        _log_cache_hit(cached, route="classify_full", runtime=runtime)
+        return jsonify(cached)
 
     # Get thumbnail from API if not provided
     if not thumbnail_url:

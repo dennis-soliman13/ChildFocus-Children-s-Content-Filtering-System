@@ -17,14 +17,20 @@ def get_best_thumbnail_url(thumbnails: dict) -> str:
 
 
 def extract_video_id(url: str) -> str:
-    """Extracts video ID from a YouTube URL."""
-    if "v=" in url:
-        return url.split("v=")[1].split("&")[0]
-    elif "youtu.be/" in url:
-        return url.split("youtu.be/")[1].split("?")[0]
-    elif "shorts/" in url:
-        return url.split("shorts/")[1].split("?")[0]
-    return url.strip()
+    """Extracts video ID from a YouTube URL. Always returns an 11-char ID."""
+    import re
+    url = url.strip()
+    for pattern in [r"[?&]v=([A-Za-z0-9_-]{11})",
+                    r"youtu\.be/([A-Za-z0-9_-]{11})",
+                    r"shorts/([A-Za-z0-9_-]{11})"]:
+        m = re.search(pattern, url)
+        if m:
+            return m.group(1)
+    # Raw ID passed (possibly repeated) — extract first valid 11-char sequence
+    m = re.search(r"([A-Za-z0-9_-]{11})", url)
+    if m:
+        return m.group(1)
+    return url
 
 
 def get_video_metadata(video_id: str) -> dict:
