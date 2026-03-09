@@ -1,314 +1,205 @@
 """
-ChildFocus - Naïve Bayes Classifier Module
+ChildFocus - Naïve Bayes Metadata Classifier
 backend/app/modules/naive_bayes.py
 
-Sprint 2 — Metadata-based probabilistic classification.
-
-Loads pre-trained model from ml_training/outputs/:
-  - nb_model.pkl    : trained MultinomialNB or ComplementNB classifier
-  - vectorizer.pkl  : fitted TF-IDF vectorizer
-
-Pipeline (per manuscript Chapter 2 + Figure 2):
-  Input metadata (title, description, tags)
-      ↓
-  Text cleaning + tokenization
-      ↓
-  Stop-word removal
-      ↓
-  TF-IDF feature vectorization
-      ↓
-  Score_NB = (1/Z) × [log P(C_over) + Σ log P(token | C_over)]
-      ↓
-  Logistic normalization → Score_NB ∈ [0, 1]
-
-Score_NB is then consumed by hybrid_fusion.py:
-  Score_final = α × Score_NB + (1 - α) × Score_H
-  where α = 0.4 (metadata weight, per manuscript)
+score_metadata() returns a plain dict — compatible with tests and hybrid_fusion.py
+score_from_metadata_dict() returns a SimpleNamespace for dot-notation (classify.py)
 """
 
 import os
-import re
 import pickle
-import logging
-from dataclasses import dataclass
-from typing import Optional
-
+import re
+import types
 import numpy as np
 
-logger = logging.getLogger(__name__)
-
-# ── Model paths ────────────────────────────────────────────────────────────────
-_BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
-_OUTPUTS_DIR   = os.path.normpath(
-    os.path.join(_BASE_DIR, "..", "..", "..", "ml_training", "outputs")
+# ── Model paths (primary: backend/app/models, fallback: ml_training/outputs) ──
+_MODULE_DIR          = os.path.dirname(os.path.abspath(__file__))
+_MODELS_DIR_PRIMARY  = os.path.normpath(os.path.join(_MODULE_DIR, "..", "models"))
+_MODELS_DIR_FALLBACK = os.path.normpath(
+    os.path.join(_MODULE_DIR, "..", "..", "..", "ml_training", "outputs")
 )
-MODEL_PATH      = os.path.join(_OUTPUTS_DIR, "nb_model.pkl")
-VECTORIZER_PATH = os.path.join(_OUTPUTS_DIR, "vectorizer.pkl")
 
-# ── Class label → overstimulation index mapping ───────────────────────────────
-LABEL_TO_IDX = {
-    "Educational":     0,
-    "Neutral":         1,
-    "Overstimulating": 2,
-}
+_MODEL_PATH    = None
+_VEC_PATH      = None
 
-OVERSTIM_CLASS = "Overstimulating"
-
-# ── Stop words (lightweight, no NLTK dependency) ──────────────────────────────
-_STOP_WORDS = {
-    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
-    "of", "with", "by", "from", "is", "it", "this", "that", "was", "are",
-    "be", "as", "at", "so", "we", "he", "she", "they", "you", "i", "my",
-    "your", "his", "her", "its", "our", "their", "what", "which", "who",
-    "will", "would", "could", "should", "has", "have", "had", "do", "does",
-    "did", "not", "no", "if", "then", "than", "when", "where", "how",
-    "all", "each", "more", "also", "just", "can", "up", "out", "about",
-    "into", "than", "too", "very", "s", "t", "re", "ve", "ll", "d",
-}
+# ── Lazy-loaded globals ────────────────────────────────────────────────────────
+_model         = None
+_vectorizer    = None
+_label_encoder = None
+_label_names   = None
+_OVER_IDX      = -1
+_metrics_cache = {}
 
 
-# ── Output dataclass ───────────────────────────────────────────────────────────
-@dataclass
-class NBResult:
-    """Result from Naïve Bayes metadata classification."""
-    score_nb:        float
-    predicted_label: str
-    confidence:      float
-    probabilities:   dict
-    text_used:       str
-    model_loaded:    bool = True
-    error:           Optional[str] = None
-
-
-# ── Model loader (singleton) ──────────────────────────────────────────────────
-class _ModelCache:
-    """
-    Loads nb_model.pkl and vectorizer.pkl once and caches them.
-    Thread-safe for concurrent Flask requests.
-    """
-    _model         = None
-    _vectorizer    = None
-    _classes       = None
-    _label_encoder = None   # sklearn LabelEncoder if saved in pkl dict
-    _label_names   = None   # ['Educational', 'Neutral', 'Overstimulating']
-    _loaded        = False
-    _error         = None
-
-    @classmethod
-    def load(cls) -> bool:
-        if cls._loaded:
-            return cls._error is None
-        try:
-            if not os.path.exists(MODEL_PATH):
-                raise FileNotFoundError(f"Model not found: {MODEL_PATH}")
-            if not os.path.exists(VECTORIZER_PATH):
-                raise FileNotFoundError(f"Vectorizer not found: {VECTORIZER_PATH}")
-
-            with open(MODEL_PATH, "rb") as f:
-                raw = pickle.load(f)
-
-            # ── Unwrap if saved as a dict (e.g. {"model": clf, ...}) ──────────
-            if isinstance(raw, dict):
-                cls._model = (
-                    raw.get("model")      or
-                    raw.get("classifier") or
-                    raw.get("nb")         or
-                    next(iter(raw.values()))
-                )
-                # Pull label encoder and label names if present
-                cls._label_encoder = raw.get("label_encoder")
-                cls._label_names   = raw.get("label_names")  # e.g. ['Educational','Neutral','Overstimulating']
-                print(f"[NB] ✓ Unwrapped model from dict. Keys: {list(raw.keys())}")
-                print(f"[NB] ✓ Label names: {cls._label_names}")
-            else:
-                cls._model = raw
-
-            with open(VECTORIZER_PATH, "rb") as f:
-                cls._vectorizer = pickle.load(f)
-
-            # Validate sklearn interface
-            if not hasattr(cls._model, "classes_"):
-                raise AttributeError(
-                    f"Model has no 'classes_'. Type: {type(cls._model)}. "
-                    f"Check dict keys in nb_model.pkl."
-                )
-
-            cls._classes = list(cls._model.classes_)
-            cls._loaded  = True
-            cls._error   = None
-            logger.info(f"[NB] Model loaded. Classes: {cls._classes}")
-            print(f"[NB] ✓ Model loaded from {_OUTPUTS_DIR}")
-            print(f"[NB] ✓ Classes: {cls._classes}")
+def _resolve_paths() -> bool:
+    global _MODEL_PATH, _VEC_PATH
+    for directory in [_MODELS_DIR_PRIMARY, _MODELS_DIR_FALLBACK]:
+        mp = os.path.join(directory, "nb_model.pkl")
+        vp = os.path.join(directory, "vectorizer.pkl")
+        if os.path.exists(mp) and os.path.exists(vp):
+            _MODEL_PATH = mp
+            _VEC_PATH   = vp
             return True
-
-        except Exception as e:
-            cls._error  = str(e)
-            cls._loaded = True
-            logger.error(f"[NB] Failed to load model: {e}")
-            print(f"[NB] ✗ Model load failed: {e}")
-            return False
-
-    @classmethod
-    def get(cls):
-        cls.load()
-        return cls._model, cls._vectorizer, cls._classes, cls._error
+    return False
 
 
-# ── Text preprocessing ────────────────────────────────────────────────────────
-def preprocess_text(title: str = "", description: str = "", tags: list = None) -> str:
-    """
-    Clean and combine metadata fields into a single text string.
+def _load_models() -> bool:
+    global _model, _vectorizer, _label_encoder, _label_names, _OVER_IDX, _metrics_cache
 
-    Pipeline:
-      1. Combine title (weighted 3x) + tags (weighted 2x) + description
-      2. Lowercase
-      3. Remove URLs, special characters, numbers
-      4. Remove stop words
-      5. Collapse whitespace
-    """
-    tags = tags or []
+    if _model is not None:
+        return True
 
-    title_text = f"{title} " * 3
-    tags_text  = f"{' '.join(tags)} " * 2
-    desc_text  = description[:300] if description else ""
-
-    raw  = f"{title_text}{tags_text}{desc_text}"
-    text = raw.lower()
-    text = re.sub(r"https?://\S+|www\.\S+", " ", text)
-    text = re.sub(r"[^a-z\s]", " ", text)
-
-    tokens = [t for t in text.split() if t not in _STOP_WORDS and len(t) > 1]
-    return " ".join(tokens)
-
-
-# ── Logistic normalization ────────────────────────────────────────────────────
-def _logistic(x: float) -> float:
-    return float(1.0 / (1.0 + np.exp(-x)))
-
-
-def _normalize_score(proba_overstim: float) -> float:
-    """
-    Normalize raw overstimulation probability to Score_NB ∈ [0, 1].
-    Applies logistic stretch to sharpen separation between classes.
-    """
-    stretched = (proba_overstim - 0.5) * 6.0
-    return round(float(np.clip(_logistic(stretched), 0.0, 1.0)), 4)
-
-
-# ── Main inference function ───────────────────────────────────────────────────
-def score_metadata(
-    title:       str  = "",
-    description: str  = "",
-    tags:        list = None,
-) -> NBResult:
-    """
-    Classify video metadata and return Score_NB ∈ [0, 1].
-
-    Score_NB represents the overstimulation likelihood from metadata alone.
-    Higher = more likely to be overstimulating based on title/tags/description.
-    """
-    tags = tags or []
-
-    model, vectorizer, classes, load_error = _ModelCache.get()
-
-    if load_error or model is None:
-        print(f"[NB] ⚠ Model unavailable, returning neutral score. Error: {load_error}")
-        return NBResult(
-            score_nb        = 0.5,
-            predicted_label = "Neutral",
-            confidence      = 0.0,
-            probabilities   = {},
-            text_used       = "",
-            model_loaded    = False,
-            error           = load_error,
-        )
-
-    cleaned_text = preprocess_text(title, description, tags)
-
-    if not cleaned_text.strip():
-        return NBResult(
-            score_nb        = 0.5,
-            predicted_label = "Neutral",
-            confidence      = 0.33,
-            probabilities   = {c: 0.33 for c in classes},
-            text_used       = cleaned_text,
-            error           = "Empty metadata after preprocessing",
-        )
+    if not _resolve_paths():
+        print(f"[NB] ✗ Model files not found. Run: cd ml_training/scripts && py train_nb.py")
+        return False
 
     try:
-        X     = vectorizer.transform([cleaned_text])
-        proba = model.predict_proba(X)[0]   # shape: (n_classes,)
-        pred  = model.predict(X)[0]         # integer index (0, 1, 2)
+        with open(_MODEL_PATH, "rb") as f:
+            bundle = pickle.load(f)
 
-        # ── Resolve human-readable label names ────────────────────────────────
-        # Model was trained with integer-encoded labels (0, 1, 2).
-        # Use label_names from the pkl dict to map back to strings.
-        label_names = _ModelCache._label_names or ["Educational", "Neutral", "Overstimulating"]
+        if isinstance(bundle, dict):
+            print(f"[NB] ✓ Unwrapped model from dict. Keys: {list(bundle.keys())}")
+            _model         = bundle["model"]
+            _label_encoder = bundle["label_encoder"]
+            raw_names      = bundle.get("label_names", list(_label_encoder.classes_))
+            _label_names   = [str(x) for x in raw_names]
+            _metrics_cache = bundle.get("metrics", {})
+        else:
+            _model = bundle
+            from sklearn.preprocessing import LabelEncoder
+            _label_encoder = LabelEncoder()
+            _label_encoder.fit(["Educational", "Neutral", "Overstimulating"])
+            _label_names = ["Educational", "Neutral", "Overstimulating"]
 
-        # Map integer prediction → string label
-        pred_int        = int(pred)
-        predicted_label = label_names[pred_int] if pred_int < len(label_names) else str(pred)
+        with open(_VEC_PATH, "rb") as f:
+            _vectorizer = pickle.load(f)
 
-        # Build probability dict with string keys {label: probability}
-        prob_dict = {
-            label_names[i] if i < len(label_names) else str(c): round(float(p), 4)
-            for i, (c, p) in enumerate(zip(classes, proba))
-        }
+        classes   = [str(c) for c in _label_encoder.classes_]
+        _OVER_IDX = classes.index("Overstimulating") if "Overstimulating" in classes else -1
 
-        # Get overstimulation probability using resolved label names
-        overstim_idx   = label_names.index(OVERSTIM_CLASS) if OVERSTIM_CLASS in label_names else -1
-        proba_overstim = float(proba[overstim_idx]) if overstim_idx >= 0 else 0.5
-
-        score_nb = _normalize_score(proba_overstim)
-
-        print(f"[NB] '{title[:40]}' → {predicted_label} | Score_NB={score_nb} | P(over)={proba_overstim:.3f}")
-
-        return NBResult(
-            score_nb        = score_nb,
-            predicted_label = predicted_label,
-            confidence      = round(float(np.max(proba)), 4),
-            probabilities   = prob_dict,
-            text_used       = cleaned_text[:200],
-        )
+        print(f"[NB] ✓ Label names: {_label_names}")
+        print(f"[NB] ✓ Model loaded from {os.path.dirname(_MODEL_PATH)}")
+        print(f"[NB] ✓ Classes: {list(_label_encoder.classes_)}")
+        return True
 
     except Exception as e:
-        logger.error(f"[NB] Inference error: {e}")
-        print(f"[NB] ✗ Inference error: {e}")
-        return NBResult(
-            score_nb        = 0.5,
-            predicted_label = "Neutral",
-            confidence      = 0.0,
-            probabilities   = {},
-            text_used       = cleaned_text,
-            model_loaded    = True,
-            error           = str(e),
-        )
+        print(f"[NB] ✗ Failed to load model: {e}")
+        return False
 
 
-# ── Convenience wrapper ───────────────────────────────────────────────────────
-def score_from_metadata_dict(metadata: dict) -> NBResult:
+def _clean_text(text: str) -> str:
+    text = text.lower()
+    text = re.sub(r"http\S+|www\S+", " ", text)
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# PUBLIC API
+# ════════════════════════════════════════════════════════════════════════════════
+
+def score_metadata(
+    title:       str  = "",
+    tags:        list = None,
+    description: str  = "",
+) -> dict:
     """
-    Convenience wrapper accepting a dict from youtube_api.get_video_metadata().
+    Compute Score_NB from video metadata.
 
-    Usage:
-        meta   = youtube_api.get_video_metadata(video_id)
-        result = naive_bayes.score_from_metadata_dict(meta)
-        score  = result.score_nb
+    Returns a plain dict:
+        score_nb      (float)  — P(Overstimulating) in [0.0, 1.0]
+        label         (str)    — Predicted OIR class
+        confidence    (float)  — Max class probability
+        probabilities (dict)   — Per-class probability map
+        status        (str)    — "success" | "empty_text" | "model_not_loaded" | "error:..."
     """
-    return score_metadata(
-        title       = metadata.get("title",       ""),
+    if not _load_models():
+        return {
+            "score_nb":      0.5,
+            "label":         "Uncertain",
+            "confidence":    0.0,
+            "probabilities": {},
+            "status":        "model_not_loaded",
+        }
+
+    tags_str     = " ".join(str(t) for t in tags) if isinstance(tags, list) else (tags or "")
+    desc_trimmed = (description or "")[:500]
+    combined     = _clean_text(f"{title} {desc_trimmed} {tags_str}")
+
+    if not combined.strip():
+        return {
+            "score_nb":      0.5,
+            "label":         "Uncertain",
+            "confidence":    0.0,
+            "probabilities": {},
+            "status":        "empty_text",
+        }
+
+    try:
+        X          = _vectorizer.transform([combined])
+        proba      = _model.predict_proba(X)[0]
+        classes    = [str(c) for c in _label_encoder.classes_]
+        proba_dict = {cls: round(float(p), 4) for cls, p in zip(classes, proba)}
+        score_nb   = float(proba[_OVER_IDX]) if _OVER_IDX >= 0 else 0.5
+        pred_idx   = int(np.argmax(proba))
+        pred_label = str(_label_encoder.classes_[pred_idx])
+
+        print(f"[NB] {title[:45]!r} → {pred_label} | Score_NB={round(score_nb,4)} | P(over)={round(score_nb,3)}")
+
+        return {
+            "score_nb":      round(score_nb, 4),
+            "label":         pred_label,
+            "confidence":    round(float(np.max(proba)), 4),
+            "probabilities": proba_dict,
+            "status":        "success",
+        }
+
+    except Exception as e:
+        print(f"[NB] ✗ Scoring error: {e}")
+        return {
+            "score_nb":      0.5,
+            "label":         "Uncertain",
+            "confidence":    0.0,
+            "probabilities": {},
+            "status":        f"error: {e}",
+        }
+
+
+def score_from_metadata_dict(metadata: dict):
+    """
+    Wrapper for classify.py — accepts a metadata dict, returns a SimpleNamespace
+    so classify.py can use dot notation: result.score_nb, result.predicted_label
+    """
+    result = score_metadata(
+        title       = metadata.get("title", ""),
+        tags        = metadata.get("tags", []),
         description = metadata.get("description", ""),
-        tags        = metadata.get("tags",        []),
     )
+    obj                 = types.SimpleNamespace()
+    obj.score_nb        = result["score_nb"]
+    obj.predicted_label = result["label"]
+    obj.confidence      = result["confidence"]
+    obj.probabilities   = result["probabilities"]
+    obj.status          = result["status"]
+    return obj
 
 
-# ── Model status check ────────────────────────────────────────────────────────
+def get_model_metrics() -> dict:
+    """
+    Returns training metrics from nb_model.pkl bundle.
+    Used by /health endpoint and test_naive_bayes.py.
+    """
+    _load_models()
+    return dict(_metrics_cache) if _metrics_cache else {}
+
+
 def model_status() -> dict:
-    """Returns model loading status. Used by /health endpoint."""
-    model, _, classes, error = _ModelCache.get()
+    """Returns model loading status for /health endpoint."""
+    loaded = _load_models()
     return {
-        "loaded":      model is not None,
-        "model_path":  MODEL_PATH,
-        "classes":     _ModelCache._label_names or classes or [],
-        "error":       error,
+        "loaded":     loaded,
+        "model_path": _MODEL_PATH or "not found",
+        "classes":    [str(c) for c in _label_encoder.classes_] if loaded and _label_encoder else [],
+        "over_idx":   _OVER_IDX,
     }
