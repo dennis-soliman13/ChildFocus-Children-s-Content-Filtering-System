@@ -22,8 +22,8 @@ import com.childfocus.model.ClassificationResult
  */
 @Composable
 fun ResultScreen(
-    result:   ClassificationResult,
-    onBack:   () -> Unit,
+    result: ClassificationResult,
+    onBack: () -> Unit,
 ) {
     Column(
         modifier = Modifier
@@ -95,10 +95,10 @@ fun ResultScreen(
                             fontSize   = 13.sp,
                         )
                         Spacer(Modifier.height(4.dp))
-                        ScoreRow("Frame-Change Rate (FCR)",      seg.fcr)
-                        ScoreRow("Color Saturation Var. (CSV)",  seg.csv)
-                        ScoreRow("Audio Tempo (ATT)",            seg.att)
-                        ScoreRow("Segment Score_H",              seg.scoreH)
+                        ScoreRow("Frame-Change Rate (FCR)",     seg.fcr)
+                        ScoreRow("Color Saturation Var. (CSV)", seg.csv)
+                        ScoreRow("Audio Tempo (ATT)",           seg.att)
+                        ScoreRow("Segment Score_H",             seg.scoreH)
                     }
                 }
             }
@@ -108,6 +108,76 @@ fun ResultScreen(
     }
 }
 
+// ── ClassificationResultCard ──────────────────────────────────────────────────
+
+@Composable
+fun ClassificationResultCard(result: ClassificationResult) {
+    val (bgColor, labelColor) = when (result.oirLabel) {
+        "Educational"    -> Color(0xFFE8F5E9) to Color(0xFF2E7D32)
+        "Overstimulating" -> Color(0xFFFFEBEE) to Color(0xFFC62828)
+        else              -> Color(0xFFFFF8E1) to Color(0xFFF57F17)  // Neutral
+    }
+
+    val emoji = when (result.oirLabel) {
+        "Educational"    -> "✅"
+        "Overstimulating" -> "🚫"
+        else              -> "⚠️"
+    }
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors   = CardDefaults.cardColors(containerColor = bgColor),
+    ) {
+        Column(
+            modifier            = Modifier.padding(20.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Text(text = emoji, fontSize = 40.sp)
+            Spacer(Modifier.height(8.dp))
+            Text(
+                text       = result.oirLabel,
+                fontSize   = 20.sp,
+                fontWeight = FontWeight.Bold,
+                color      = labelColor,
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                text     = "Final Score: ${String.format("%.3f", result.scoreFinal)}",
+                fontSize = 13.sp,
+                color    = labelColor.copy(alpha = 0.8f),
+            )
+
+        }
+    }
+}
+
+// ── ScoreRow ──────────────────────────────────────────────────────────────────
+
+@Composable
+fun ScoreRow(label: String, value: Float) {
+    Row(
+        modifier          = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 3.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text     = label,
+            fontSize = 13.sp,
+            color    = Color.DarkGray,
+            modifier = Modifier.weight(1f),
+        )
+        Text(
+            text       = String.format("%.4f", value),
+            fontSize   = 13.sp,
+            fontWeight = FontWeight.Medium,
+            color      = Color.Black,
+        )
+    }
+}
+
+// ── SectionHeader ─────────────────────────────────────────────────────────────
 
 @Composable
 fun SectionHeader(title: String) {
@@ -119,6 +189,7 @@ fun SectionHeader(title: String) {
     )
 }
 
+// ── InfoCard ──────────────────────────────────────────────────────────────────
 
 @Composable
 fun InfoCard(content: @Composable ColumnScope.() -> Unit) {
