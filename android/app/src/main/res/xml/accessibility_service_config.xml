@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    ChildFocus Accessibility Service Configuration
+    Location: android/app/src/main/res/xml/accessibility_service_config.xml
+
+    This config tells Android to:
+      - Only watch the YouTube app (com.google.android.youtube)
+      - Listen for window state changes (new video started)
+      - Listen for content changes (video ID in URL bar changed)
+      - Allow reading window content so we can extract the video_id
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:packageNames="com.google.android.youtube"
+    android:canRetrieveWindowContent="true"
+    android:settingsActivity="com.childfocus.ui.MainActivity"
+    android:description="@string/accessibility_description" />
