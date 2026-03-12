@@ -4,6 +4,7 @@ import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
 import android.content.Intent
 import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -15,47 +16,26 @@ import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 import java.util.regex.Pattern
 
-/**
- * ChildFocusAccessibilityService
- *
- * Monitors the YouTube app and automatically detects when a new video
- * is being watched. When detected it sends the video_id to the Flask
- * backend for full OIR classification.
- *
- * Per thesis Figure 3 (Hybrid Algorithm Flowchart):
- *   "Detect video_id (page DOM / player event)"
- *
- * How to enable:
- *   Android Settings → Accessibility → ChildFocus → Toggle ON
- *
- * NOTE: On a physical device, change BASE_URL from 10.0.2.2 to your
- *       PC's local IP address (e.g. 192.168.1.x).
- *       On emulator, 10.0.2.2 maps to the host machine's localhost.
- */
 class ChildFocusAccessibilityService : AccessibilityService() {
 
-    // ── Backend URL ────────────────────────────────────────────────────────────
-    // Emulator  → 10.0.2.2:5000  (host machine localhost)
-    // Real device → change to your PC's IP e.g. 192.168.1.100:5000
-    private val BASE_URL = "http://10.0.2.2:5000"
+    private val scope   = CoroutineScope(Dispatchers.IO)
+    private var lastTitle = ""
 
-    // ── State ──────────────────────────────────────────────────────────────────
-    private val scope  = CoroutineScope(Dispatchers.IO)
-    private var lastId = ""                     // avoid re-classifying same video
-
-    // ── HTTP client (90s read timeout — full analysis takes ~15-20s) ──────────
     private val http = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(90, TimeUnit.SECONDS)
-        .writeTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(120, TimeUnit.SECONDS)
         .build()
 
-    // ── Regex: extract 11-char video ID from any YouTube URL format ───────────
-    private val VIDEO_ID_PATTERN: Pattern = Pattern.compile(
-        "(?:v=|youtu\\.be/|/shorts/)([a-zA-Z0-9_-]{11})"
+    // YouTube exposes: "Minimized player <Title> <Title> @Channel ..."
+    // The title always appears right after "Minimized player" and is repeated once
+    private val TITLE_PATTERN = Pattern.compile(
+        "Minimized player\\s+(.+?)\\s+\\1",
+        Pattern.DOTALL
     )
 
-    // ── Lifecycle ──────────────────────────────────────────────────────────────
+    // Also match URL-based video IDs if YouTube ever exposes them
+    private val URL_PATTERN = Pattern.compile("(?:v=|youtu\\.be/)([a-zA-Z0-9_-]{11})")
+
     override fun onServiceConnected() {
         serviceInfo = AccessibilityServiceInfo().apply {
             eventTypes   = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or
@@ -68,98 +48,131 @@ class ChildFocusAccessibilityService : AccessibilityService() {
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        // Collect all text nodes from the event
-        val allText = buildString {
-            event?.text?.forEach { append(it).append(" ") }
-            event?.source?.let { node ->
-                // Also check the URL bar content if accessible
-                for (i in 0 until node.childCount) {
-                    node.getChild(i)?.text?.let { append(it).append(" ") }
-                }
-            }
+        event ?: return
+
+        // Strategy 1: direct URL in event text (rare but handle it)
+        val eventText = event.text?.joinToString(" ") ?: ""
+        val urlMatch  = URL_PATTERN.matcher(eventText)
+        if (urlMatch.find()) {
+            val vid = urlMatch.group(1) ?: return
+            handleVideoId(vid)
+            return
         }
 
-        val videoId = extractVideoId(allText) ?: return
+        // Strategy 2: extract title from node tree
+        val root    = rootInActiveWindow ?: return
+        val allText = collectAllNodeText(root)
+        root.recycle()
 
-        // Skip if we already processed this video
-        if (videoId == lastId) return
-        lastId = videoId
+        // Try URL pattern in full tree first
+        val urlInTree = URL_PATTERN.matcher(allText)
+        if (urlInTree.find()) {
+            handleVideoId(urlInTree.group(1) ?: return)
+            return
+        }
 
-        println("[CF_SERVICE] ✓ New video detected: $videoId")
+        // Extract title using "Minimized player <Title> <Title>" pattern
+        val titleMatch = TITLE_PATTERN.matcher(allText)
+        if (titleMatch.find()) {
+            val title = titleMatch.group(1)?.trim() ?: return
+            if (title != lastTitle && title.length > 5) {
+                lastTitle = title
+                println("[CF_SERVICE] ✓ Detected title: $title")
+                scope.launch { classifyByTitle(title) }
+            }
+        }
+    }
 
-        // Broadcast "analyzing" state to UI immediately
-        sendBroadcast(Intent("com.childfocus.CLASSIFICATION_RESULT").apply {
-            putExtra("video_id",  videoId)
-            putExtra("oir_label", "Analyzing")
-            putExtra("score_final", 0.5f)
-            putExtra("cached",    false)
-        })
+    private fun handleVideoId(videoId: String) {
+        // Convert ID directly to URL and classify
+        scope.launch {
+            classifyByUrl(
+                videoId  = videoId,
+                videoUrl = "https://www.youtube.com/watch?v=$videoId",
+                thumbUrl = "https://i.ytimg.com/vi/$videoId/hqdefault.jpg"
+            )
+        }
+    }
 
-        // Run classification on IO thread (never block accessibility thread)
-        scope.launch { classifyVideo(videoId) }
+    private fun collectAllNodeText(node: AccessibilityNodeInfo): String {
+        val sb = StringBuilder()
+        try {
+            node.text?.let               { sb.append(it).append(" ") }
+            node.contentDescription?.let { sb.append(it).append(" ") }
+            for (i in 0 until node.childCount) {
+                val child = node.getChild(i) ?: continue
+                sb.append(collectAllNodeText(child))
+                child.recycle()
+            }
+        } catch (_: Exception) { }
+        return sb.toString()
+    }
+
+    // ── Title-based classification (main path) ────────────────────────────────
+
+    private fun classifyByTitle(title: String) {
+        try {
+            val body = JSONObject().apply {
+                put("title", title)
+            }
+
+            val request = Request.Builder()
+                .url("http://10.0.2.2:5000/classify_by_title")
+                .post(body.toString().toRequestBody("application/json".toMediaType()))
+                .build()
+
+            val response = http.newCall(request).execute()
+            val json     = JSONObject(response.body?.string() ?: return)
+
+            handleClassificationResult(json)
+
+        } catch (e: Exception) {
+            println("[CF_SERVICE] ✗ classify_by_title error: ${e.message}")
+        }
+    }
+
+    // ── Direct URL classification (fallback when video ID is known) ───────────
+
+    private fun classifyByUrl(videoId: String, videoUrl: String, thumbUrl: String) {
+        try {
+            val body = JSONObject().apply {
+                put("video_url",     videoUrl)
+                put("thumbnail_url", thumbUrl)
+            }
+
+            val request = Request.Builder()
+                .url("http://10.0.2.2:5000/classify_full")
+                .post(body.toString().toRequestBody("application/json".toMediaType()))
+                .build()
+
+            val response = http.newCall(request).execute()
+            val json     = JSONObject(response.body?.string() ?: return)
+
+            handleClassificationResult(json)
+
+        } catch (e: Exception) {
+            println("[CF_SERVICE] ✗ classify_full error: ${e.message}")
+        }
+    }
+
+    private fun handleClassificationResult(json: JSONObject) {
+        val label   = json.optString("oir_label", "Neutral")
+        val score   = json.optDouble("score_final", 0.5)
+        val cached  = json.optBoolean("cached", false)
+        val videoId = json.optString("video_id", "unknown")
+
+        println("[CF_SERVICE] $videoId → $label ($score) cached=$cached")
+
+        val intent = Intent("com.childfocus.CLASSIFICATION_RESULT").apply {
+            putExtra("video_id",    videoId)
+            putExtra("oir_label",   label)
+            putExtra("score_final", score.toFloat())
+            putExtra("cached",      cached)
+        }
+        sendBroadcast(intent)
     }
 
     override fun onInterrupt() {
         println("[CF_SERVICE] Interrupted")
-    }
-
-    // ── Helpers ────────────────────────────────────────────────────────────────
-    private fun extractVideoId(text: String): String? {
-        val matcher = VIDEO_ID_PATTERN.matcher(text)
-        return if (matcher.find()) matcher.group(1) else null
-    }
-
-    private fun classifyVideo(videoId: String) {
-        try {
-            println("[CF_SERVICE] Classifying: $videoId")
-
-            val body = JSONObject().apply {
-                put("video_url",     "https://www.youtube.com/watch?v=$videoId")
-                put("thumbnail_url", "https://i.ytimg.com/vi/$videoId/hqdefault.jpg")
-            }.toString().toRequestBody("application/json".toMediaType())
-
-            val request = Request.Builder()
-                .url("$BASE_URL/classify_full")
-                .post(body)
-                .build()
-
-            val response = http.newCall(request).execute()
-
-            if (!response.isSuccessful) {
-                println("[CF_SERVICE] ✗ HTTP ${response.code} for $videoId")
-                broadcastError(videoId)
-                return
-            }
-
-            val json     = JSONObject(response.body?.string() ?: return)
-            val label    = json.optString("oir_label",   json.optString("label", "Neutral"))
-            val score    = json.optDouble("final_score", 0.5).toFloat()
-            val cached   = json.optBoolean("cached", false)
-            val title    = json.optString("video_title", "")
-
-            println("[CF_SERVICE] ✓ $videoId → $label ($score) cached=$cached")
-
-            // Broadcast result → SafetyViewModel → SafetyModeScreen
-            sendBroadcast(Intent("com.childfocus.CLASSIFICATION_RESULT").apply {
-                putExtra("video_id",    videoId)
-                putExtra("video_title", title)
-                putExtra("oir_label",   label)
-                putExtra("score_final", score)
-                putExtra("cached",      cached)
-            })
-
-        } catch (e: Exception) {
-            println("[CF_SERVICE] ✗ Error classifying $videoId: ${e.message}")
-            broadcastError(videoId)
-        }
-    }
-
-    private fun broadcastError(videoId: String) {
-        sendBroadcast(Intent("com.childfocus.CLASSIFICATION_RESULT").apply {
-            putExtra("video_id",    videoId)
-            putExtra("oir_label",   "Error")
-            putExtra("score_final", 0.5f)
-            putExtra("cached",      false)
-        })
     }
 }
